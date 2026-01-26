@@ -2,21 +2,21 @@ import serial
 import time
 import math
 from PIL import Image
+import sys
 
-PORT_NAME = '/dev/cu.usbserial-FTEFZBD9' #Replace with serial port name
+PORT_NAME = '/dev/cu.usbserial-FTEFZBD9'
 
 # --- Configuration ---
 COM_PORT = PORT_NAME
 BAUD_RATE = 9600
-BAND_HEIGHT = 24
-BITMAP_PATH = "bitmap.bmp"
-
-# Safe printable height for 24mm tape using 24-dot bands is 120 dots (5 bands)
-# (6 bands = 144 dots, which overflows the 128-dot limit)
+BAND_HEIGHT = 24       # Printer fixed band height
+# The printable area for 24mm tape is effectively 120 dots (5 bands)
 SAFE_PRINT_HEIGHT = 120 
 
+IMG_PATH = sys.argv[1]
+
 def safe_send(ser, data, chunk_size=32):
-    """Helps respects the printer's 512B reception buffer"""
+    """Spoon-feed data to respect the printer's small buffer"""
     total_len = len(data)
     for i in range(0, total_len, chunk_size):
         chunk = data[i:i+chunk_size]
@@ -24,31 +24,19 @@ def safe_send(ser, data, chunk_size=32):
         ser.flush() 
         time.sleep(0.02) 
 
-def parse_status_byte(byte_val, mapping):
-    return [desc for bit, desc in mapping.items() if byte_val & (1 << bit)]
-
 def check_status(ser, step_name):
     ser.reset_input_buffer()
     ser.write(b'\x1B\x69\x53')
     time.sleep(0.2)
     response = ser.read(32)
 
-    print(f"\n--- Status Check: {step_name} ---")
     if len(response) != 32:
-        print(f"Incomplete status packet ({len(response)} bytes)")
         return None
 
-    err1_map = {0: "NO TAPE", 1: "TAPE END", 2: "CUTTER JAM"}
-    err2_map = {0: "TAPE CHANGE ERR", 1: "PRINT BUFFER FULL",
-                2: "TRANSMISSION ERR", 3: "RX BUFFER FULL"}
-
-    errors = parse_status_byte(response[8], err1_map) + parse_status_byte(response[9], err2_map)
-    if errors:
-        print(f"CRITICAL ERRORS: {errors}")
-    else:
-        print("Errors: None")
+    # Simple error check
+    if response[8] != 0 or response[9] != 0:
+        print(f"Status Error [{step_name}]: Byte8={response[8]}, Byte9={response[9]}")
     
-    print(f"Tape Width: {response[10]} mm")
     return response
 
 def wait_for_printer_ready(ser, step_name="Waiting"):
@@ -57,24 +45,25 @@ def wait_for_printer_ready(ser, step_name="Waiting"):
         if response is not None:
             if response[8] == 0 and response[9] == 0:
                 return True
-            # If buffer full, we can't recover without a reset
-            if (response[9] & 2): 
-                print("Buffer Full Error detected during wait.")
-                return False
         time.sleep(0.5)
     return False
 
 def load_bitmap_to_canvas(path):
+    # Load image and convert to 1-bit monochrome
     img = Image.open(path).convert("1")
+    
     width, height = img.size
     
-    # Resize to the SAFE height (120 dots) to prevent overflow
+    # Force height to 120 dots to fit the tape bands.
     if height != SAFE_PRINT_HEIGHT:
-        print(f"Resizing image height from {height} to {SAFE_PRINT_HEIGHT} (5 bands)...")
-        img = img.resize((width, SAFE_PRINT_HEIGHT))
+        aspect_ratio = width / height
+        new_width = int(SAFE_PRINT_HEIGHT * aspect_ratio)
+        print(f"Resizing: {width}x{height} -> {new_width}x{SAFE_PRINT_HEIGHT}")
+        img = img.resize((new_width, SAFE_PRINT_HEIGHT))
         width, height = img.size
 
     pixels = img.load()
+    # Convert PIL pixels (0=Black, 255=White) to Printer bits (1=Black, 0=White)
     canvas = [[0 for _ in range(width)] for _ in range(height)]
     for y in range(height):
         for x in range(width):
@@ -84,21 +73,21 @@ def load_bitmap_to_canvas(path):
 def generate_full_bands(canvas):
     width = len(canvas[0])
     height = len(canvas)
-    # Force strictly 5 bands for safety on 24mm tape
+    # Strictly 5 bands (120 dots)
     num_bands = 5 
     bands = []
-
-    print(f"Generating {num_bands} bands from canvas...")
 
     for band_idx in range(num_bands):
         start_row = band_idx * BAND_HEIGHT
         band_data = bytearray()
         for x in range(width):
             col_bits = 0
+            # Pack 24 vertical pixels into 3 bytes
             for bit_offset in range(BAND_HEIGHT):
                 y = start_row + bit_offset
                 if y < height and canvas[y][x]:
                     col_bits |= (1 << (23 - bit_offset))
+            
             band_data.extend([
                 (col_bits >> 16) & 0xFF,
                 (col_bits >> 8) & 0xFF,
@@ -117,48 +106,50 @@ def main():
             xonxoff=True
         )
         
-        print(f"Opened {COM_PORT}")
+        print(f"Connected to {COM_PORT}")
         
-        # 1. Initialize (Clear Buffer)
+        # 1. Initialize
         ser.write(b'\x1B\x40')
         time.sleep(0.5)
         
-        # 2. Check Status
-        if not wait_for_printer_ready(ser, "After Init"):
-            print("Printer error. Aborting.")
+        if not wait_for_printer_ready(ser, "Init"):
+            print("Printer not ready.")
             return
 
-        # 3. Set Mode (Auto Cut OFF)
-        ser.write(b'\x1B\x69\x4D\x00') 
+        # 2. Set Mode (Enable Auto-Cut)
+        # Bit 6=1 (Auto Cut On), Feed=Large
+        ser.write(b'\x1B\x69\x4D\x40') 
+
+        # ser.write(b'\x1B\x69\x4D\x00') # Auto cut off
         time.sleep(0.1)
 
-        # 4. Prepare Data
-        canvas = load_bitmap_to_canvas(BITMAP_PATH)
+        # 3. Process Image
+        canvas = load_bitmap_to_canvas(IMG_PATH)
         bands = generate_full_bands(canvas)
         
-        print(f"\nPrinting: {len(canvas[0])} dots long. {len(bands)} bands.")
+        print(f"Printing Label: {len(canvas[0])} dots wide.")
 
-        # 5. Send Bands
+        # 4. Send Bands (Lines)
         for i, (band_data, width) in enumerate(bands):
-            print(f"Sending Band {i+1}/{len(bands)}...")
+            print(f"Sending Band {i+1}/5...")
             
             n1 = width & 0xFF
             n2 = (width >> 8) & 0xFF
             
-            # Send Command + Data
+            # ESC * m(39) n1 n2 [DATA]
             ser.write(bytearray([0x1B, 0x2A, 39, n1, n2]))
             safe_send(ser, band_data)
             
-            # Send CR LF to move to next band position
+            # CR LF (Move cursor to start of next band)
             ser.write(b'\x0D\x0A')    
             time.sleep(0.1)
 
-        print("Triggering Print...")
-        ser.write(b'\x0C') # FF (Print without Cut)
-        # ser.write(b'\x1A') # (Print and Cut)
+        print("Triggering Print & Cut...")
+        # [FIX 3] CTRL-Z (1A) to Print AND Cut
+        ser.write(b'\x0C') # Don't cut
         
-        time.sleep(2)
-        wait_for_printer_ready(ser, "Final Check")
+        # Wait for mechanical action
+        time.sleep(4)
         ser.close()
         print("Done.")
 
